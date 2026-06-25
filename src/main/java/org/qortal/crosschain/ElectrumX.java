@@ -48,7 +48,8 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 	private static final long PROBE_RETRY_MS = 5 * 60 * 1000L;
 	private static final long FAILURE_PENALTY_MS = 5000L;
 
-	private static final int BLOCK_HEADER_LENGTH = 80;
+	private static final int DEFAULT_BLOCK_HEADER_LENGTH = 80;
+	private int blockHeaderLength = DEFAULT_BLOCK_HEADER_LENGTH;
 
 	// "message": "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. Use gettransaction for wallet transactions.'})"
 	private static final Pattern DAEMON_ERROR_REGEX = Pattern.compile("DaemonError\\(\\{.*'code': ?(-?[0-9]+).*\\}\\)\\z"); // Capture 'code' inside curly-brace content
@@ -208,6 +209,10 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 		this.blockchain = blockchain;
 	}
 
+	public void setBlockHeaderLength(int length) {
+		this.blockHeaderLength = length;
+	}
+
 	@Override
 	public String getNetId() {
 		return this.netId;
@@ -278,27 +283,35 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 		// and can't be used to accurately identify block indexes, then there are sufficient checks to ensure an
 		// exception is thrown.
 
-		if (raw.length == returnedCount * BLOCK_HEADER_LENGTH) {
+		if (raw.length == returnedCount * blockHeaderLength) {
 			// Fixed-length header (BTC, LTC, etc)
 			for (int i = 0; i < returnedCount; ++i) {
-				rawBlockHeaders.add(Arrays.copyOfRange(raw, i * BLOCK_HEADER_LENGTH, (i + 1) * BLOCK_HEADER_LENGTH));
+				rawBlockHeaders.add(Arrays.copyOfRange(raw, i * blockHeaderLength, (i + 1) * blockHeaderLength));
 			}
 		}
-		else if (raw.length > returnedCount * BLOCK_HEADER_LENGTH) {
-			// Assume AuxPoW variable length header (DOGE)
-			int referenceVersion = BitTwiddling.intFromLEBytes(raw, 0); // DOGE uses 6422788 at time of commit (Jul 2021)
-			for (int i = 0; i < raw.length - 4; ++i) {
-				// Locate the start of each block by its version number
-				if (BitTwiddling.intFromLEBytes(raw, i) == referenceVersion) {
-					rawBlockHeaders.add(Arrays.copyOfRange(raw, i, i + BLOCK_HEADER_LENGTH));
+		else if (raw.length > returnedCount * blockHeaderLength) {
+			if (raw.length % blockHeaderLength == 0) {
+				// Server returned extra fixed-length data (e.g. checkpoint proof appended to hex).
+				// Take only the first returnedCount headers.
+				for (int i = 0; i < returnedCount; ++i) {
+					rawBlockHeaders.add(Arrays.copyOfRange(raw, i * blockHeaderLength, (i + 1) * blockHeaderLength));
+				}
+			} else {
+				// Assume AuxPoW variable length header (DOGE)
+				int referenceVersion = BitTwiddling.intFromLEBytes(raw, 0); // DOGE uses 6422788 at time of commit (Jul 2021)
+				for (int i = 0; i < raw.length - 4; ++i) {
+					// Locate the start of each block by its version number
+					if (BitTwiddling.intFromLEBytes(raw, i) == referenceVersion) {
+						rawBlockHeaders.add(Arrays.copyOfRange(raw, i, i + blockHeaderLength));
+					}
+				}
+				// Ensure that we found the correct number of block headers
+				if (rawBlockHeaders.size() != count) {
+					throw new ForeignBlockchainException.NetworkException("Unexpected raw header contents in JSON from ElectrumX blockchain.block.headers RPC.");
 				}
 			}
-			// Ensure that we found the correct number of block headers
-			if (rawBlockHeaders.size() != count) {
-				throw new ForeignBlockchainException.NetworkException("Unexpected raw header contents in JSON from ElectrumX blockchain.block.headers RPC.");
-			}
 		}
-		else if (raw.length != returnedCount * BLOCK_HEADER_LENGTH) {
+		else if (raw.length != returnedCount * blockHeaderLength) {
 			throw new ForeignBlockchainException.NetworkException("Unexpected raw header length in JSON from ElectrumX blockchain.block.headers RPC");
 		}
 
@@ -726,7 +739,7 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 
 		List<ElectrumServer> servers = drainRandomly(this.availableConnections, this.availableConnections.size() / 2);
 
-		LOGGER.info("{} draining count {}", this.blockchain.currencyCode, servers.size());
+		LOGGER.info("{} draining count {}", this.blockchain == null ? "ElectrumX" : this.blockchain.currencyCode, servers.size());
 		return servers;
 	}
 
