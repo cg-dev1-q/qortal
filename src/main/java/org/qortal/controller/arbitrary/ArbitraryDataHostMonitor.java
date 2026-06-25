@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Class ArbitraryDataHostMonitor
@@ -76,12 +77,14 @@ public class ArbitraryDataHostMonitor extends Thread{
 
                 LOGGER.info("Collecting index paths ...");
 
-                List<Path> indexPaths
-                        = Files.walk(dataPath, 2)
-                        .filter(Files::isDirectory)
-                        .filter(path -> !path.toAbsolutePath().toString().contains(tempPath.toAbsolutePath().toString())
-                                && !path.toString().contains("_misc"))
-                        .collect(Collectors.toList());
+                List<Path> indexPaths;
+                try (Stream<Path> walk = Files.walk(dataPath, 2)) {
+                    indexPaths = walk
+                            .filter(Files::isDirectory)
+                            .filter(path -> !path.toAbsolutePath().toString().contains(tempPath.toAbsolutePath().toString())
+                                    && !path.toString().contains("_misc"))
+                            .collect(Collectors.toList());
+                }
 
                 LOGGER.info("Collected {} index paths", indexPaths.size());
 
@@ -94,10 +97,13 @@ public class ArbitraryDataHostMonitor extends Thread{
 
                     Thread.sleep(10);
 
-                    List<Path> paths = Files.walk(indexPath, 1)
-                            .filter(Files::isDirectory)
-                            .filter(path -> path.getFileName().toString().length() > 32)
-                            .collect(Collectors.toList());
+                    List<Path> paths;
+                    try (Stream<Path> walk = Files.walk(indexPath, 1)) {
+                        paths = walk
+                                .filter(Files::isDirectory)
+                                .filter(path -> path.getFileName().toString().length() > 32)
+                                .collect(Collectors.toList());
+                    }
 
                     for (Path path : paths) {
                         String[] contents = path.toFile().list();
@@ -123,14 +129,22 @@ public class ArbitraryDataHostMonitor extends Thread{
                     currentSignaturesDecoded.add(Base58.decode(currentSignature));
                 }
 
-                // get all transaction data for current signatures
-                List<TransactionData> currentTransactions;
-                try (final Repository repository = RepositoryManager.getRepository()) {
-
-                    currentTransactions = repository.getTransactionRepository().fromSignatures(currentSignaturesDecoded);
-
-                    LOGGER.info("data count = {}", currentTransactions.size());
+                // get all transaction data for current signatures, batched to avoid giant IN(...) queries
+                // ponytail: 500 keeps query time bounded; tune down if pool contention recurs
+                final int BATCH_SIZE = 500;
+                int totalSigs = currentSignaturesDecoded.size();
+                int batchCount = (totalSigs + BATCH_SIZE - 1) / BATCH_SIZE;
+                LOGGER.info("Fetching transactions: {} signatures in {} batch(es) of up to {}", totalSigs, batchCount, BATCH_SIZE);
+                List<TransactionData> currentTransactions = new ArrayList<>(totalSigs);
+                for (int i = 0; i < currentSignaturesDecoded.size(); i += BATCH_SIZE) {
+                    if( isStopping ) break;
+                    List<byte[]> batch = currentSignaturesDecoded.subList(i, Math.min(i + BATCH_SIZE, currentSignaturesDecoded.size()));
+                    try (final Repository repository = RepositoryManager.getRepository()) {
+                        currentTransactions.addAll(repository.getTransactionRepository().fromSignatures(batch));
+                    }
                 }
+
+                LOGGER.info("data count = {}", currentTransactions.size());
 
                 List<ArbitraryHostedDataItemInfo> hostedTransactions = new ArrayList<>(currentTransactions.size());
 

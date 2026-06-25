@@ -374,6 +374,10 @@ public class NamesDatabaseIntegrityCheck {
             else if (transactionData instanceof UpdateNameTransactionData) {
                 UpdateNameTransactionData updateNameTransactionData = (UpdateNameTransactionData) transactionData;
                 involvedNames.add(updateNameTransactionData.getName());
+                String reducedOldName = Unicode.sanitize(updateNameTransactionData.getName());
+                if (reducedOldName != null && !reducedOldName.isEmpty()) {
+                    involvedNames.add(reducedOldName);
+                }
                 if (updateNameTransactionData.getNewName() != null) {
                     involvedNames.add(updateNameTransactionData.getNewName());
                     String reducedNewName = Unicode.sanitize(updateNameTransactionData.getNewName());
@@ -432,10 +436,12 @@ public class NamesDatabaseIntegrityCheck {
                 TransactionType.REGISTER_NAME, Arrays.asList("(name = ? OR reduced_name = ?)"), Arrays.asList(name, reducedName));
         signatures.addAll(registerNameTransactions);
 
+        // Match old name by both exact value and its reduced (lowercased) form, since historic names may differ in case.
+        // 'reducedName' is already Unicode.sanitize(name) which lowercases; using LOWER() for case-insensitive column match.
         List<byte[]> updateNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
                 TransactionType.UPDATE_NAME,
-                Arrays.asList("(name = ? OR new_name = ? OR (reduced_new_name != '' AND reduced_new_name = ?))"),
-                Arrays.asList(name, name, reducedName));
+                Arrays.asList("(name = ? OR LOWER(name) = LOWER(?) OR new_name = ? OR (reduced_new_name != '' AND reduced_new_name = ?))"),
+                Arrays.asList(name, name, name, reducedName));
         signatures.addAll(updateNameTransactions);
 
         List<byte[]> sellNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(

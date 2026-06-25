@@ -538,6 +538,60 @@ public class IntegrityTests extends Common {
         }
     }
 
+    // Regression test for issue #314:
+    // Registering a case-variant of a name that was renamed away should succeed,
+    // not return NAME_ALREADY_REGISTERED due to incomplete history replay in rebuildName().
+    @Test
+    public void testRegisterAfterCaseVariantRename() throws DataException {
+        try (final Repository repository = RepositoryManager.getRepository()) {
+            PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+            PrivateKeyAccount bob = Common.getTestAccount(repository, "bob");
+
+            // Mint past multipleNamesPerAccountHeight so oneNamePerAccount check doesn't interfere
+            BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+            // Register "Qombo" as alice
+            String originalName = "Qombo";
+            RegisterNameTransactionData registerData = new RegisterNameTransactionData(TestTransaction.generateBase(alice), originalName, "{}");
+            registerData.setFee(new RegisterNameTransaction(null, null).getUnitFee(registerData.getTimestamp()));
+            TransactionUtils.signAndMint(repository, registerData, alice);
+            assertTrue(repository.getNameRepository().nameExists(originalName));
+
+            // Rename "Qombo" -> "something-else" (frees the reduced name "qombo")
+            String renamedName = "something-else";
+            UpdateNameTransactionData renameData = new UpdateNameTransactionData(TestTransaction.generateBase(alice), originalName, renamedName, "");
+            TransactionUtils.signAndMint(repository, renameData, alice);
+            assertFalse(repository.getNameRepository().nameExists(originalName));
+            assertTrue(repository.getNameRepository().nameExists(renamedName));
+
+            // Simulate DB inconsistency: delete "something-else" from Names
+            repository.getNameRepository().delete(renamedName);
+            assertNull(repository.getNameRepository().fromName(renamedName));
+
+            // Verify rebuildName finds both REGISTER_NAME and UPDATE_NAME via the case-variant lookup
+            NamesDatabaseIntegrityCheck integrityCheck = new NamesDatabaseIntegrityCheck();
+            String lowercaseName = "qombo";
+            List<org.qortal.data.transaction.TransactionData> txns = integrityCheck.fetchAllTransactionsInvolvingName(lowercaseName, repository);
+            assertEquals("rebuildName should find both REGISTER_NAME and UPDATE_NAME for case-variant", 2, txns.size());
+
+            // After rebuild, "qombo" reduced name should not exist (renamed away)
+            integrityCheck.rebuildName(lowercaseName, repository);
+            assertFalse("qombo reduced name should not exist after rebuildName", repository.getNameRepository().reducedNameExists(lowercaseName));
+            repository.discardChanges();
+
+            // Bob tries to register "qombo" — should succeed because "Qombo" was renamed away
+            // Before the fix, rebuildName("qombo") found the REGISTER_NAME but missed the UPDATE_NAME
+            // due to case-sensitive mismatch, leaving "qombo" in Names → NAME_ALREADY_REGISTERED.
+            RegisterNameTransactionData newRegisterData = new RegisterNameTransactionData(TestTransaction.generateBase(bob), lowercaseName, "{}");
+            newRegisterData.setFee(new RegisterNameTransaction(null, null).getUnitFee(newRegisterData.getTimestamp()));
+            Transaction transaction = Transaction.fromData(repository, newRegisterData);
+            transaction.sign(bob);
+
+            Transaction.ValidationResult result = transaction.importAsUnconfirmed();
+            assertEquals("qombo should be registerable after Qombo was renamed away", Transaction.ValidationResult.OK, result);
+        }
+    }
+
     @Ignore("Checks 'live' repository")
     @Test
     public void testRepository() throws DataException {

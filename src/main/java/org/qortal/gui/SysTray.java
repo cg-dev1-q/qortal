@@ -37,10 +37,15 @@ public class SysTray {
 
 	private SysTray() {
 		try {
-			if (!SystemTray.isSupported())
+			if (!SystemTray.isSupported()) {
+				LOGGER.warn("System tray not available: SystemTray.isSupported()=false, headless={}, DISPLAY={}, DBUS_SESSION_BUS_ADDRESS={}",
+						GraphicsEnvironment.isHeadless(),
+						System.getenv("DISPLAY"),
+						System.getenv("DBUS_SESSION_BUS_ADDRESS"));
 				return;
+			}
 		} catch (AWTError e) {
-			// Even SystemTray.isSupported can fail, so catch that too
+			LOGGER.warn("System tray not available: SystemTray.isSupported() threw AWTError: {}", e.getMessage());
 			return;
 		}
 
