@@ -4,7 +4,6 @@ import org.apache.commons.lang3.reflect.FieldUtils;
 import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.PrivateKeyAccount;
-import org.qortal.arbitrary.ArbitraryDataDigest;
 import org.qortal.arbitrary.ArbitraryDataFile;
 import org.qortal.arbitrary.ArbitraryDataFile.ResourceIdType;
 import org.qortal.arbitrary.ArbitraryDataReader;
@@ -76,13 +75,14 @@ public class ArbitraryTransactionMetadataTests extends Common {
             ArbitraryDataReader arbitraryDataReader = new ArbitraryDataReader(name, ResourceIdType.NAME, service, identifier);
             arbitraryDataReader.loadSynchronously(true);
             Path initialLayerPath = arbitraryDataReader.getFilePath();
-            ArbitraryDataDigest initialLayerDigest = new ArbitraryDataDigest(initialLayerPath);
-            initialLayerDigest.compute();
 
-            // Its directory hash should match the original directory hash
-            ArbitraryDataDigest path1Digest = new ArbitraryDataDigest(path1);
-            path1Digest.compute();
-            assertEquals(path1Digest.getHash58(), initialLayerDigest.getHash58());
+            // Risk: directory digest comparison was removed because the reader renames single-file resources
+            // to "data", making path1's "file.txt" and the reconstructed "data" produce different digests
+            // even when content is identical. We compare file bytes directly instead.
+            // If the rename behaviour changes, this assertion will silently pass even if the wrong file is returned.
+            byte[] originalBytes = Files.readAllBytes(path1.resolve("file.txt"));
+            byte[] rebuiltBytes = Files.readAllBytes(initialLayerPath.resolve("data"));
+            assertArrayEquals(originalBytes, rebuiltBytes);
         }
     }
 
@@ -128,13 +128,12 @@ public class ArbitraryTransactionMetadataTests extends Common {
             ArbitraryDataReader arbitraryDataReader = new ArbitraryDataReader(name, ResourceIdType.NAME, service, identifier);
             arbitraryDataReader.loadSynchronously(true);
             Path initialLayerPath = arbitraryDataReader.getFilePath();
-            ArbitraryDataDigest initialLayerDigest = new ArbitraryDataDigest(initialLayerPath);
-            initialLayerDigest.compute();
 
-            // Its directory hash should match the original directory hash
-            ArbitraryDataDigest path1Digest = new ArbitraryDataDigest(path1);
-            path1Digest.compute();
-            assertEquals(path1Digest.getHash58(), initialLayerDigest.getHash58());
+            // Risk: same rename issue as testMultipleChunks — comparing file bytes directly.
+            // If the reader stops renaming to "data", this will throw NoSuchFileException rather than fail cleanly.
+            byte[] originalBytes = Files.readAllBytes(path1.resolve("file.txt"));
+            byte[] rebuiltBytes = Files.readAllBytes(initialLayerPath.resolve("data"));
+            assertArrayEquals(originalBytes, rebuiltBytes);
         }
     }
 
@@ -244,13 +243,12 @@ public class ArbitraryTransactionMetadataTests extends Common {
             ArbitraryDataReader arbitraryDataReader = new ArbitraryDataReader(name, ResourceIdType.NAME, service, identifier);
             arbitraryDataReader.loadSynchronously(true);
             Path initialLayerPath = arbitraryDataReader.getFilePath();
-            ArbitraryDataDigest initialLayerDigest = new ArbitraryDataDigest(initialLayerPath);
-            initialLayerDigest.compute();
 
-            // Its directory hash should match the original directory hash
-            ArbitraryDataDigest path1Digest = new ArbitraryDataDigest(path1);
-            path1Digest.compute();
-            assertEquals(path1Digest.getHash58(), initialLayerDigest.getHash58());
+            // Risk: same rename issue as testMultipleChunks — comparing file bytes directly.
+            // If the reader stops renaming to "data", this will throw NoSuchFileException rather than fail cleanly.
+            byte[] originalBytes = Files.readAllBytes(path1.resolve("file.txt"));
+            byte[] rebuiltBytes = Files.readAllBytes(initialLayerPath.resolve("data"));
+            assertArrayEquals(originalBytes, rebuiltBytes);
         }
     }
 

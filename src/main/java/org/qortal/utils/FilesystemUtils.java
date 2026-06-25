@@ -260,10 +260,15 @@ public class FilesystemUtils {
         } else if (Files.isDirectory(path)) {
             String[] files = ArrayUtils.removeElement(path.toFile().list(), ".qortal");
             if (files.length == 1) {
-                filePath = path.resolve(files[0]);
+                Path candidate = path.resolve(files[0]);
+                // Only treat as single-file if the sole entry is actually a file, not a subdirectory.
+                // A subdirectory means INVALID_FILE_COUNT, not a readable single file.
+                if (Files.isRegularFile(candidate)) {
+                    filePath = candidate;
+                }
             }
         }
-    
+
         if (filePath == null || !Files.exists(filePath)) {
             return null;
         }
