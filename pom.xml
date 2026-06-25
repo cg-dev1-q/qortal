@@ -8,6 +8,8 @@
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<skipJUnitTests>true</skipJUnitTests>
+		<!-- Override with -DexcludeNetworkTests=nothing to run network tests -->
+		<excludeNetworkTests>**/crosschain/BitcoinTests.java,**/crosschain/LitecoinTests.java,**/crosschain/RavencoinTests.java,**/crosschain/PirateChainTests.java</excludeNetworkTests>
 
 		<altcoinj.version>d7cf6ac</altcoinj.version> <!-- BC v16 / Updated Abstract Classes / alertSigningKey -->
 		<bitcoinj.version>0.16.3</bitcoinj.version>
@@ -436,6 +438,9 @@
 				<version>${maven-surefire-plugin.version}</version>
 				<configuration>
 					<skipTests>${skipJUnitTests}</skipTests>
+					<excludes>
+						<exclude>${excludeNetworkTests}</exclude>
+					</excludes>
 				</configuration>
 			</plugin>
 		</plugins>

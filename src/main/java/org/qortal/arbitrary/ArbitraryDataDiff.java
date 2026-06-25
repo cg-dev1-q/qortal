@@ -11,6 +11,7 @@ import org.qortal.settings.Settings;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.MalformedInputException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
@@ -328,12 +329,21 @@ public class ArbitraryDataDiff {
         else {
             // Attempt to create patch using java-diff-utils
             UnifiedDiffPatch unifiedDiffPatch = new UnifiedDiffPatch(beforePathAbsolute, afterPathAbsolute, destination);
-            unifiedDiffPatch.create();
-            if (unifiedDiffPatch.isValid()) {
+            boolean unifiedDiffSucceeded = false;
+            try {
+                unifiedDiffPatch.create();
+                unifiedDiffSucceeded = true;
+            } catch (MalformedInputException e) {
+                // File contains non-UTF-8 bytes (binary file) — fall through to COMPLETE_FILE copy.
+                // Risk: any other charset that isn't UTF-8 will also fall through here, which is correct
+                // behaviour. If UnifiedDiffPatch is ever extended to support binary diffs, remove this catch.
+                LOGGER.debug("File appears to be binary, falling back to complete-file copy: {}", afterPathAbsolute);
+            }
+            if (unifiedDiffSucceeded && unifiedDiffPatch.isValid()) {
                 diffType = DiffType.UNIFIED_DIFF;
             }
             else {
-                // Diff failed validation, so copy the whole file instead
+                // Diff failed or was invalid, so copy the whole file instead
                 this.copyFilePathToBaseDir(afterPathAbsolute, destinationBasePathAbsolute, afterPathRelative);
                 diffType = DiffType.COMPLETE_FILE;
             }

@@ -270,6 +270,9 @@ public class ArbitraryDataStoragePolicyTests extends Common {
         } catch (IOException e) {
 
         }
+
+        // Delete stale folder-size estimate so the storage manager recalculates from scratch
+        new java.io.File("qortal-backup/ArbitraryDataFolderSizeEstimate.dat").delete();
     }
 
     private void deleteListsDirectory() {
