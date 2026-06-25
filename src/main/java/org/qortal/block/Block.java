@@ -223,12 +223,15 @@ public class Block {
 			final AccountLevelShareBin[] shareBinsByLevel = (blockHeight >= blockChain.getSharesByLevelV2Height()) ?
 					blockChain.getShareBinsByAccountLevelV2() : blockChain.getShareBinsByAccountLevelV1();
 
+			if (blockHeight < blockChain.getShareBinFixHeight()) {
+				// Off-by-one bug still in effect: index == accountLevel, so length-1 is max valid
+				if (accountLevel >= shareBinsByLevel.length)
+					return null;
+				return shareBinsByLevel[accountLevel];
+			}
+
 			if (accountLevel > shareBinsByLevel.length)
 				return null;
-
-			if (blockHeight < blockChain.getShareBinFixHeight())
-				// Off-by-one bug still in effect
-				return shareBinsByLevel[accountLevel];
 
 			// level 1 stored at index 0, level 2 stored at index 1, etc.
 			return shareBinsByLevel[accountLevel-1];
@@ -1784,10 +1787,14 @@ public class Block {
 
 			final int effectiveBlocksMinted = accountData.getBlocksMinted() + blocksMintedAdjustment + accountData.getBlocksMintedPenalty();
 
+			// Allow level decrease only at the exact block where adjustment removal takes effect,
+			// so genesis-assigned levels aren't silently dropped on every subsequent block
+			final boolean isAdjustmentRemovalBlock = this.blockData.getHeight() == BlockChain.getInstance().getMintedBlocksAdjustmentRemovalHeight() + 1;
+
 			for (int newLevel = maximumLevel; newLevel >= 0; --newLevel)
 				if (effectiveBlocksMinted >= cumulativeBlocksByLevel.get(newLevel)) {
-					if (newLevel != accountData.getLevel()) {
-						// Account has increased in level!
+					if (newLevel > accountData.getLevel() || (isAdjustmentRemovalBlock && newLevel != accountData.getLevel())) {
+						// Account has changed level
 						accountData.setLevel(newLevel);
 						bumpedAccounts.put(accountData.getAddress(), newLevel);
 						repository.getAccountRepository().setLevel(accountData);
