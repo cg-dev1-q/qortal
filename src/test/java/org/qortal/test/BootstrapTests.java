@@ -221,11 +221,20 @@ public class BootstrapTests extends Common {
                 String bootstrapFilename = String.format("bootstrap-%s.7z", type);
                 String bootstrapUrl = String.format("%s/%s", host, bootstrapFilename);
 
-                // Make a HEAD request to check the status of each bootstrap file
+                // Make a HEAD request to check the status of each bootstrap file, following redirects
                 URL url = new URL(bootstrapUrl);
                 HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                connection.setInstanceFollowRedirects(true);
                 connection.setRequestMethod("HEAD");
                 connection.connect();
+                // Follow HTTP->HTTPS redirects manually (cross-protocol redirects aren't auto-followed)
+                if (connection.getResponseCode() / 100 == 3) {
+                    String location = connection.getHeaderField("Location");
+                    connection.disconnect();
+                    connection = (HttpURLConnection) new URL(location).openConnection();
+                    connection.setRequestMethod("HEAD");
+                    connection.connect();
+                }
                 long fileSize = connection.getContentLengthLong();
                 long lastModified = connection.getLastModified();
                 connection.disconnect();

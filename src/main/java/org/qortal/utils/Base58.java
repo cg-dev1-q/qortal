@@ -16,8 +16,8 @@
  */
 package org.qortal.utils;
 
-import java.io.UnsupportedEncodingException;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /**
@@ -90,14 +90,7 @@ public class Base58 {
         //
         // Create the return string from the encoded bytes
         //
-        String encodedResult;
-        try {
-            byte[] stringBytes = Arrays.copyOfRange(encoded, encodedOffset, encoded.length);
-            encodedResult = new String(stringBytes, "US-ASCII");
-        } catch (UnsupportedEncodingException exc) {
-            encodedResult = "";             // Should never happen
-        }
-        return encodedResult;
+        return new String(encoded, encodedOffset, encoded.length - encodedOffset, StandardCharsets.US_ASCII);
     }
 
     /**

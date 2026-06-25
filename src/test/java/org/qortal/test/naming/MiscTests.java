@@ -332,6 +332,7 @@ public class MiscTests extends Common {
 				assertNull(repository.getNameRepository().fromName(name));
 
 			}
+			repository.discardChanges();
 		}
 	}
 

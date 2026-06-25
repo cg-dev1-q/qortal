@@ -56,6 +56,8 @@ public class IntegrityTests extends Common {
 
             // Ensure the name still exists and the data is still correct
             assertEquals(data, repository.getNameRepository().fromName(name).getData());
+
+            repository.discardChanges();
         }
     }
 
@@ -136,6 +138,8 @@ public class IntegrityTests extends Common {
             // Ensure the new name still exists and the data is still correct
             assertTrue(repository.getNameRepository().nameExists(initialName));
             assertEquals(initialData, repository.getNameRepository().fromName(initialName).getData());
+
+            repository.discardChanges();
         }
     }
 
@@ -167,6 +171,8 @@ public class IntegrityTests extends Common {
             // Ensure the name still exists and the data is still correct
             assertEquals(name, repository.getNameRepository().fromName(name).getName());
             assertEquals(newData, repository.getNameRepository().fromName(name).getData());
+
+            repository.discardChanges();
         }
     }
 
@@ -228,6 +234,8 @@ public class IntegrityTests extends Common {
 
             // Ensure the name exists again and the data is correct
             assertEquals(data, repository.getNameRepository().fromName(name).getData());
+
+            repository.discardChanges();
         }
     }
 
@@ -267,6 +275,8 @@ public class IntegrityTests extends Common {
 
             // Ensure the name exists and the data is correct
             assertEquals(newData, repository.getNameRepository().fromName(name).getData());
+
+            repository.discardChanges();
         }
     }
 
@@ -313,6 +323,8 @@ public class IntegrityTests extends Common {
             Transaction.ValidationResult result = transaction.importAsUnconfirmed();
             assertTrue("Transaction should be invalid", Transaction.ValidationResult.OK != result);
             assertTrue("Name should already be registered", Transaction.ValidationResult.NAME_ALREADY_REGISTERED == result);
+
+            repository.discardChanges();
         }
     }
 
@@ -348,6 +360,8 @@ public class IntegrityTests extends Common {
             Transaction.ValidationResult result = transaction.importAsUnconfirmed();
             assertTrue("Transaction should be invalid", Transaction.ValidationResult.OK != result);
             assertTrue("Name should already be registered", Transaction.ValidationResult.NAME_ALREADY_REGISTERED == result);
+
+            repository.discardChanges();
         }
     }
 
@@ -382,6 +396,8 @@ public class IntegrityTests extends Common {
             // Transaction should be valid, because the database inconsistency was fixed by UpdateNameTransaction.preProcess()
             Transaction.ValidationResult result = transaction.importAsUnconfirmed();
             assertTrue("Transaction should be valid", Transaction.ValidationResult.OK == result);
+
+            repository.discardChanges();
         }
     }
 
@@ -433,6 +449,8 @@ public class IntegrityTests extends Common {
             assertTrue("Destination name should already exist", Transaction.ValidationResult.NOT_SUPPORTED == result);
 
             assertEquals(alice.getPrimaryName(), alice.determinePrimaryName(TransactionsResource.ConfirmationStatus.CONFIRMED));
+
+            repository.discardChanges();
         }
     }
 
@@ -465,6 +483,8 @@ public class IntegrityTests extends Common {
             // Transaction should be valid, because the database inconsistency was fixed by SellNameTransaction.preProcess()
             Transaction.ValidationResult result = transaction.importAsUnconfirmed();
             assertTrue("Transaction should be valid", Transaction.ValidationResult.OK == result);
+
+            repository.discardChanges();
         }
     }
 
@@ -513,6 +533,8 @@ public class IntegrityTests extends Common {
             // Transaction should be valid, because the database inconsistency was fixed by SellNameTransaction.preProcess()
             Transaction.ValidationResult result = transaction.importAsUnconfirmed();
             assertTrue("Transaction should be valid", Transaction.ValidationResult.OK == result);
+
+            repository.discardChanges();
         }
     }
 
