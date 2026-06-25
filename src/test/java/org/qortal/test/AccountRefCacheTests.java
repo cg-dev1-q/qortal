@@ -4,7 +4,7 @@ import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.Account;
 import org.qortal.account.AccountRefCache;
-import org.qortal.account.PublicKeyAccount;
+import org.qortal.account.PrivateKeyAccount;
 import org.qortal.data.transaction.PaymentTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.repository.DataException;
@@ -52,6 +52,8 @@ public class AccountRefCacheTests extends Common {
 
 			// 3rd ref should not match 1st ref
 			assertFalse("setLastReference() failed?", Arrays.equals(lastRef1, lastRef3));
+
+			repository.discardChanges();
 		}
 	}
 
@@ -78,6 +80,8 @@ public class AccountRefCacheTests extends Common {
 
 			// 3rd ref should not match 1st ref
 			assertFalse("setLastReference() failed?", Arrays.equals(lastRef1, lastRef3));
+
+			repository.discardChanges();
 		}
 	}
 
@@ -153,11 +157,15 @@ public class AccountRefCacheTests extends Common {
 				accountRefCache.commit();
 			}
 
+			repository.saveChanges();
+
 			// fetch 5th ref
 			byte[] lastRef5 = account.getLastReference();
 
 			// 5th ref should match committed ref
 			assertTrue("getLastReference() should return pre-cache value", Arrays.equals(committedRef, lastRef5));
+
+			repository.discardChanges();
 		}
 	}
 
@@ -235,11 +243,15 @@ public class AccountRefCacheTests extends Common {
 				accountRefCache.commit();
 			}
 
+			repository.saveChanges();
+
 			// fetch 5th ref
 			byte[] lastRef5 = account.getLastReference();
 
 			// 5th ref should match committed ref
 			assertTrue("getLastReference() should return pre-cache value", Arrays.equals(committedRef, lastRef5));
+
+			repository.discardChanges();
 		}
 	}
 
@@ -288,9 +300,9 @@ public class AccountRefCacheTests extends Common {
 	}
 
 	private static Account createRandomAccount(Repository repository) {
-		byte[] randomPublicKey = new byte[32];
-		RANDOM.nextBytes(randomPublicKey);
-		return new PublicKeyAccount(repository, randomPublicKey);
+		byte[] randomPrivateKey = new byte[32];
+		RANDOM.nextBytes(randomPrivateKey);
+		return new PrivateKeyAccount(repository, randomPrivateKey);
 	}
 
 }

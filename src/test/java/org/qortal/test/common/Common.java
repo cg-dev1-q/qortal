@@ -186,6 +186,8 @@ public class Common {
 
 				assertEquals(initialBalance.getAddress() + " remaining balance differs", initialBalance.getBalance(), remainingBalance.getBalance());
 			}
+
+			repository.discardChanges();
 		}
 	}
 

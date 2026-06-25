@@ -594,6 +594,7 @@ public class BlockArchiveV2Tests extends Common {
 				BlockUtils.orphanBlocks(repository, 1);
 			} catch (DataException e) {
 				exception = e;
+				repository.discardChanges();
 				System.out.println("Caught expected DataException: " + e.getMessage());
 			}
 
