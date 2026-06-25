@@ -210,6 +210,8 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 	}
 
 	public void setBlockHeaderLength(int length) {
+		if (length <= 0)
+			throw new IllegalArgumentException("blockHeaderLength must be positive, got: " + length);
 		this.blockHeaderLength = length;
 	}
 
