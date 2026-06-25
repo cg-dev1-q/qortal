@@ -11,6 +11,7 @@ import org.qortal.data.block.BlockData;
 import org.qortal.data.crosschain.TradeBotData;
 import org.qortal.gui.SplashFrame;
 import org.qortal.network.Network;
+import org.qortal.repository.hsqldb.HSQLDBCacheUtils;
 import org.qortal.repository.hsqldb.HSQLDBImportExport;
 import org.qortal.repository.hsqldb.HSQLDBRepositoryFactory;
 import org.qortal.settings.Settings;
@@ -450,6 +451,8 @@ public class Bootstrap {
             // Otherwise, the caller will run into difficulties when it tries to close it
             repository.discardChanges();
             repository.close();
+            // Stop background timers before nulling the factory to avoid "No repository available" errors
+            HSQLDBCacheUtils.shutdown();
             // Now close the repository factory so that we can swap out the database files
             RepositoryManager.closeRepositoryFactory();
 
@@ -476,6 +479,24 @@ public class Bootstrap {
         finally {
             RepositoryFactory repositoryFactory = new HSQLDBRepositoryFactory(Controller.getRepositoryUrl());
             RepositoryManager.setRepositoryFactory(repositoryFactory);
+            // Restart timers that were stopped before the factory swap
+            if (Settings.getInstance().isDbCacheEnabled()) {
+                HSQLDBCacheUtils.startCaching(
+                    Settings.getInstance().getDbCacheThreadPriority(),
+                    Settings.getInstance().getDbCacheFrequency()
+                );
+            }
+            if (Settings.getInstance().isBalanceRecorderEnabled()) {
+                org.qortal.controller.hsqldb.HSQLDBBalanceRecorder.getInstance().ifPresent(
+                    recorder -> HSQLDBCacheUtils.startRecordingBalances(
+                        recorder.getBalancesByHeight(),
+                        recorder.getBalanceDynamics(),
+                        Settings.getInstance().getBalanceRecorderPriority(),
+                        Settings.getInstance().getBalanceRecorderFrequency(),
+                        Settings.getInstance().getBalanceRecorderCapacity()
+                    )
+                );
+            }
 
             blockchainLock.unlock();
         }
