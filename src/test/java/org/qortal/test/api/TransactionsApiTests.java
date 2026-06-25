@@ -1,16 +1,25 @@
 package org.qortal.test.api;
 
+import org.eclipse.persistence.jaxb.JAXBContextFactory;
+import org.eclipse.persistence.jaxb.MarshallerProperties;
 import org.junit.Before;
 import org.junit.Test;
 import org.qortal.api.resource.TransactionsResource;
 import org.qortal.api.resource.TransactionsResource.ConfirmationStatus;
+import org.qortal.data.transaction.BaseTransactionData;
+import org.qortal.data.transaction.TransactionData;
+import org.qortal.data.transaction.TransferPrivsTransactionData;
 import org.qortal.test.common.ApiCommon;
 import org.qortal.transaction.Transaction.TransactionType;
 
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.Marshaller;
+import java.io.StringWriter;
 import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class TransactionsApiTests extends ApiCommon {
 
@@ -38,6 +47,24 @@ public class TransactionsApiTests extends ApiCommon {
 	public void testGetUnconfirmedTransactions() {
 		assertNotNull(this.transactionsResource.getUnconfirmedTransactions(null, null, null, null, null));
 		assertNotNull(this.transactionsResource.getUnconfirmedTransactions(null, null, 1, 1, true));
+	}
+
+	@Test
+	public void testTransferPrivsSerializesRecipient() throws Exception {
+		BaseTransactionData base = new BaseTransactionData(System.currentTimeMillis(), 0, new byte[64], new byte[32], 10000L, null);
+		TransactionData txData = new TransferPrivsTransactionData(base, aliceAddress);
+
+		JAXBContext jc = JAXBContextFactory.createContext(new Class[] { TransactionData.class }, null);
+		Marshaller marshaller = jc.createMarshaller();
+		marshaller.setProperty(MarshallerProperties.MEDIA_TYPE, "application/json");
+		marshaller.setProperty(MarshallerProperties.JSON_INCLUDE_ROOT, false);
+
+		StringWriter sw = new StringWriter();
+		marshaller.marshal(txData, sw);
+		String json = sw.toString();
+
+		assertTrue("TRANSFER_PRIVS JSON missing 'recipient' field", json.contains("\"recipient\""));
+		assertTrue("TRANSFER_PRIVS JSON missing alice's address", json.contains(aliceAddress));
 	}
 
 	@Test
