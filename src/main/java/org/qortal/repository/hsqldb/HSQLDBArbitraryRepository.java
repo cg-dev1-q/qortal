@@ -305,11 +305,10 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 	@Override
 	public List<ArbitraryTransactionDataHashWrapper> getArbitraryTransactionSignaturesLite() throws DataException {
-		String sql = "SELECT signature, service, name, identifier, metadata_hash, Transactions.created_when " +
+		String sql = "SELECT signature, service, name, identifier, metadata_hash, created_when " +
 				"FROM ArbitraryTransactions " +
-				"JOIN Transactions USING (signature) " +
 				"WHERE name IS NOT NULL " +
-				"ORDER BY ArbitraryTransactions.created_when DESC";
+				"ORDER BY created_when DESC";
 
 		List<ArbitraryTransactionDataHashWrapper> results = new ArrayList<>();
 		try (ResultSet resultSet = this.repository.checkedExecute(sql)) {

@@ -64,6 +64,14 @@ public class HSQLDBBalanceRecorder extends Thread{
         HSQLDBCacheUtils.startRecordingBalances(this.balancesByHeight, this.balanceDynamics, this.priorityRequested, this.frequency, this.capacity);
     }
 
+    public ConcurrentHashMap<Integer, List<AccountBalanceData>> getBalancesByHeight() {
+        return this.balancesByHeight;
+    }
+
+    public CopyOnWriteArrayList<BlockHeightRangeAddressAmounts> getBalanceDynamics() {
+        return this.balanceDynamics;
+    }
+
     public List<BlockHeightRangeAddressAmounts> getLatestDynamics(int limit, long offset) {
 
         return this.balanceDynamics.stream()
