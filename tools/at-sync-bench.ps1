@@ -39,6 +39,11 @@ param(
     [string] $Mode = 'bootstrap',
 
     [int] $MaxMinutes = 60,
+
+    # How long to wait for the API to bind before giving up. Generous by default: in
+    # bootstrap mode the node downloads and extracts a multi-GB archive first.
+    [int] $ApiTimeoutMinutes = 30,
+
     [int] $BlockInterval = 100,
     [int] $ApiPort = 12391,
     [string] $OutFile,
@@ -64,6 +69,65 @@ if (-not $OutFile) {
 
 function Write-Step { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Warn { param([string] $Message) Write-Host "  ! $Message" -ForegroundColor Yellow }
+
+# Any java process running our jar, whether or not this script started it.
+function Get-QortalProcess {
+    Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*qortal.jar*' -or $_.CommandLine -like '*qortal-*.jar*' }
+}
+
+function Get-QortalApiKey {
+    $apiKeyPath = Join-Path $repoRoot 'apikey.txt'
+    if (Test-Path $apiKeyPath) { return (Get-Content $apiKeyPath -Raw).Trim() }
+    return $null
+}
+
+# /admin/stop needs an API key. The node would generate a random one at startup, but a known
+# value keeps shutdown scriptable. Only created when absent, so a real key is never clobbered.
+# Must be BOM-less: ApiKey.load() does new String(Files.readAllBytes(path)), so a BOM would
+# silently become part of the key. Settings requires at least 8 characters.
+function Initialize-QortalApiKey {
+    $apiKeyPath = Join-Path $repoRoot 'apikey.txt'
+    if (Test-Path $apiKeyPath) {
+        Write-Host "  using existing apikey.txt"
+        return
+    }
+    [System.IO.File]::WriteAllText($apiKeyPath, 'SUPER_SECRET_API_KEY', (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "  created apikey.txt with a test key"
+}
+
+# Ask the node to shut down, then kill whatever is left. A clean exit matters: it closes
+# HSQLDB properly and lets the metrics shutdown hook flush its final partial window. A node
+# left hung by a failed run will not answer /admin/stop, hence the kill fallback.
+function Stop-QortalNode {
+    param([int] $Port, [int] $GraceSec = 180)
+
+    if (-not (Get-QortalProcess)) { return }
+
+    $apiKey = Get-QortalApiKey
+    if ($apiKey) {
+        try {
+            Invoke-RestMethod -Uri "http://localhost:$Port/admin/stop?apiKey=$apiKey" -TimeoutSec 20 | Out-Null
+            Write-Host "  requested shutdown via /admin/stop"
+        } catch {
+            Write-Warn "/admin/stop failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Warn "no apikey.txt - cannot request a graceful shutdown"
+    }
+
+    $waited = 0
+    while ((Get-QortalProcess) -and $waited -lt $GraceSec) { Start-Sleep -Seconds 2; $waited += 2 }
+
+    $stubborn = Get-QortalProcess
+    if ($stubborn) {
+        Write-Warn "still running after ${waited}s - killing (final metrics window may be lost)"
+        foreach ($p in $stubborn) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+    } else {
+        Write-Host "  node exited cleanly after ${waited}s"
+    }
+}
 
 # Report metadata; populated by the run phase, left as placeholders in -ParseOnly mode.
 $useBootstrap = ($Mode -eq 'bootstrap')
@@ -94,11 +158,16 @@ if ($newestSource.LastWriteTime -gt $script:jar.LastWriteTime) {
     Write-Warn "$($script:jar.Name) is older than $($newestSource.Name) - rebuild or metrics may be stale/missing."
 }
 
-# Refuse to trash the database out from under a live node
-$running = Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
-           Where-Object { $_.CommandLine -like '*qortal.jar*' -or $_.CommandLine -like '*qortal-*.jar*' }
+# A node holding the database open must go before we can wipe it. A node left hung by a
+# previous failed run will not answer /admin/stop, so fall back to killing it.
+$running = Get-QortalProcess
 if ($running) {
-    throw "A Qortal node appears to be running (PID $($running.ProcessId -join ', ')). Stop it first (.\stop.sh)."
+    Write-Step "A Qortal node is already running (PID $($running.ProcessId -join ', '))"
+    if (-not $Force) {
+        $reply = Read-Host "Stop it and continue? (y/N)"
+        if ($reply -ne 'y') { throw "Aborted by user - node left running, nothing deleted." }
+    }
+    Stop-QortalNode -Port $ApiPort -GraceSec 30
 }
 
 # --------------------------------------------------------------------------------------
@@ -151,8 +220,15 @@ $settings = [ordered]@{
     bootstrap = $script:useBootstrap
     apiPort   = $ApiPort
 }
-($settings | ConvertTo-Json -Depth 4) | Set-Content -Path $settingsPath -Encoding utf8
+
+# Must be BOM-less: Settings.java reads this with a plain FileReader, which does not strip
+# a BOM, so JAXB fails with "Unexpected char 65279". Set-Content -Encoding utf8 emits a BOM
+# on PowerShell 5.1, hence WriteAllText with an explicit no-BOM encoder.
+$json = $settings | ConvertTo-Json -Depth 4
+[System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "  bootstrap = $($script:useBootstrap)"
+
+Initialize-QortalApiKey
 
 # --------------------------------------------------------------------------------------
 # 4. Start the node
@@ -210,6 +286,18 @@ $syncedStreak   = 0
 $requiredStreak = 3           # consecutive good polls before declaring synced
 $script:lastHeight = 0
 
+# A node that dies during startup (bad settings, port clash) can leave a non-daemon thread
+# alive, so the process never exits and HasExited never fires. Without a guard the poll loop
+# would spin "api not ready" for the whole budget.
+#
+# The guard cannot be a short timeout: in bootstrap mode the node downloads and extracts a
+# multi-GB archive before the API binds, which took ~8 min here and logs nothing at all for
+# ~5 of them - so neither a 5 min deadline nor a log-liveness check can tell "still working"
+# from "hung". Key off a fatal startup error instead, and keep the deadline generous.
+$fatalStartupPattern = 'ERROR\s+Settings:|Exception in thread "main"'
+$apiDeadline = $runStart.AddMinutes($ApiTimeoutMinutes)
+$apiEverUp   = $false
+
 while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) {
         Write-Warn "Node exited early (code $($proc.ExitCode)) - see run.log / run.err.log"
@@ -218,7 +306,32 @@ while ((Get-Date) -lt $deadline) {
 
     Start-Sleep -Seconds 15
     $s = Get-SyncState -Port $ApiPort
-    if (-not $s.Ok) { Write-Host "  api not ready yet..."; continue }
+    if (-not $s.Ok) {
+        if ($apiEverUp) {
+            # API went away after being up - node died mid-run
+            Write-Warn "API stopped responding - node may have died. See qortal.log."
+            break
+        }
+
+        Write-Host "  api not ready yet (bootstrap download/extract can take ~10 min)..."
+
+        $fatal = $null
+        if (Test-Path $LogFile) {
+            $fatal = Select-String -Path $LogFile -Pattern $fatalStartupPattern | Select-Object -Last 3
+        }
+        if ($fatal) {
+            Write-Warn "Fatal startup error - aborting:"
+            $fatal | ForEach-Object { Write-Host "      $($_.Line)" }
+            break
+        }
+
+        if ((Get-Date) -gt $apiDeadline) {
+            Write-Warn "API did not come up within $ApiTimeoutMinutes min - giving up."
+            break
+        }
+        continue
+    }
+    $apiEverUp = $true
 
     if ($null -eq $script:startHeight -and $s.Height -gt 0) { $script:startHeight = $s.Height }
     $script:lastHeight = $s.Height
@@ -255,33 +368,7 @@ if ($script:reachedSync) {
 
 Write-Step "Stopping node"
 
-if (-not $proc.HasExited) {
-    $apiKey = $null
-    $apiKeyPath = Join-Path $repoRoot 'apikey.txt'
-    if (Test-Path $apiKeyPath) { $apiKey = (Get-Content $apiKeyPath -Raw).Trim() }
-
-    if ($apiKey) {
-        try {
-            Invoke-RestMethod -Uri "http://localhost:$ApiPort/admin/stop?apiKey=$apiKey" -TimeoutSec 20 | Out-Null
-            Write-Host "  requested shutdown via /admin/stop"
-        } catch {
-            Write-Warn "/admin/stop failed: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Warn "no apikey.txt - cannot use /admin/stop"
-    }
-
-    # Give it time to close HSQLDB and run the metrics shutdown hook
-    $waited = 0
-    while (-not $proc.HasExited -and $waited -lt 180) { Start-Sleep -Seconds 2; $waited += 2 }
-
-    if (-not $proc.HasExited) {
-        Write-Warn "still running after ${waited}s - killing (final metrics window may be lost)"
-        Stop-Process -Id $proc.Id -Force
-    } else {
-        Write-Host "  exited cleanly after ${waited}s"
-    }
-}
+Stop-QortalNode -Port $ApiPort -GraceSec 180
 Remove-Item -Path (Join-Path $repoRoot 'run.pid') -Force -ErrorAction SilentlyContinue
 } # end Invoke-BenchRun
 
