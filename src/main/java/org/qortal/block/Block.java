@@ -12,6 +12,7 @@ import org.qortal.account.PrivateKeyAccount;
 import org.qortal.account.PublicKeyAccount;
 import org.qortal.asset.Asset;
 import org.qortal.at.AT;
+import org.qortal.at.ATStatesLatencyMetrics;
 import org.qortal.block.BlockChain.AccountLevelShareBin;
 import org.qortal.block.BlockChain.BlockTimingByHeight;
 import org.qortal.controller.OnlineAccountsManager;
@@ -1936,18 +1937,29 @@ public class Block {
 			throw new IllegalStateException("Cannot process AT fees and states: ourAtStates is null. Block validation may have failed.");
 		}
 
+		ATStatesLatencyMetrics metrics = ATStatesLatencyMetrics.INSTANCE;
+
 		for (ATStateData atStateData : this.ourAtStates) {
 			Account atAccount = new Account(this.repository, atStateData.getATAddress());
 
 			// Subtract AT-generated fees from AT accounts
+			long start = System.nanoTime();
 			atAccount.modifyAssetBalance(Asset.QORT, - atStateData.getFees());
+			metrics.addModifyBalance(System.nanoTime() - start);
 
 			// Update AT info with latest state
+			start = System.nanoTime();
 			ATData atData = atRepository.fromATAddress(atStateData.getATAddress());
+			metrics.addFromAtAddress(System.nanoTime() - start);
 
 			AT at = new AT(repository, atData, atStateData);
+			start = System.nanoTime();
 			at.update(this.blockData.getHeight(), this.blockData.getTimestamp());
+			metrics.addAtUpdate(System.nanoTime() - start);
 		}
+
+		metrics.addAts(this.ourAtStates.size());
+		metrics.blockProcessed(this.blockData.getHeight());
 	}
 
 	protected void linkTransactionsToBlock() throws DataException {

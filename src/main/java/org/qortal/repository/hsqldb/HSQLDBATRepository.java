@@ -4,6 +4,7 @@ import com.google.common.primitives.Longs;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.qortal.at.ATStatesLatencyMetrics;
 import org.qortal.controller.Controller;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.at.ATData;
@@ -956,11 +957,13 @@ public class HSQLDBATRepository implements ATRepository {
 				.bind("fees", atStateData.getFees()).bind("is_initial", atStateData.isInitial())
 				.bind("sleep_until_message_timestamp", atStateData.getSleepUntilMessageTimestamp());
 
+		long start = System.nanoTime();
 		try {
 			atStatesSaver.execute(this.repository);
 		} catch (SQLException e) {
 			throw new DataException("Unable to save AT state into repository", e);
 		}
+		ATStatesLatencyMetrics.INSTANCE.addSaveAtStates(System.nanoTime() - start);
 
 		if (atStateData.getStateData() != null) {
 			HSQLDBSaver atStatesDataSaver = new HSQLDBSaver("ATStatesData");
@@ -968,11 +971,13 @@ public class HSQLDBATRepository implements ATRepository {
 			atStatesDataSaver.bind("AT_address", atStateData.getATAddress()).bind("height", atStateData.getHeight())
 					.bind("state_data", atStateData.getStateData());
 
+			start = System.nanoTime();
 			try {
 				atStatesDataSaver.execute(this.repository);
 			} catch (SQLException e) {
 				throw new DataException("Unable to save AT state data into repository", e);
 			}
+			ATStatesLatencyMetrics.INSTANCE.addSaveAtStatesData(System.nanoTime() - start);
 		} else {
 			try {
 				this.repository.delete("ATStatesData", "AT_address = ? AND height = ?",

@@ -33,3 +33,8 @@
 apikey.txt
 /.env
 /.m2-local
+/qortal.log
+/qortal.log.*
+/run.err.log
+/settings.json.*.bak
+/bench/

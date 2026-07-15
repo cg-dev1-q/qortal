@@ -1,0 +1,437 @@
+﻿<#
+.SYNOPSIS
+    Benchmarks the AT fee/state persistence path (Block.processAtFeesAndStates) during a sync.
+
+.DESCRIPTION
+    Wipes the blockchain database to force a fresh sync, starts the node, waits until the
+    node is synced (or a time budget expires), stops it cleanly, then parses the AT-METRICS
+    lines from qortal.log into a markdown report.
+
+    Requires a jar built from instrumented source (target/qortal-*.jar).
+
+.PARAMETER Mode
+    bootstrap : keep bootstrap enabled (default upstream behaviour). The node downloads a
+                recent snapshot then block-syncs the gap to the chain tip. Those gap blocks
+                are recent and AT-heavy, so this is the representative "catching up" case,
+                but the sample is only as large as the gap.
+    genesis   : disable bootstrap and sync from height 1. Exercises every block, but never
+                reaches "synced" in a sane window, so it is time-bounded. Early blocks have
+                few/no ATs, so expect empty windows before AT-heavy heights are reached.
+
+.PARAMETER MaxMinutes
+    Time budget. The run stops at whichever comes first: synced, or this many minutes.
+
+.PARAMETER BlockInterval
+    Blocks per AT-METRICS reporting window (-Dqortal.atMetrics.blockInterval).
+
+.PARAMETER ParseOnly
+    Skip the wipe/start/wait entirely and just re-parse an existing log into a report.
+    Useful to re-cut the report from a previous run, or from a log copied off another node.
+
+.EXAMPLE
+    .\tools\at-sync-bench.ps1 -Mode bootstrap -MaxMinutes 45
+    .\tools\at-sync-bench.ps1 -Mode genesis -MaxMinutes 120
+    .\tools\at-sync-bench.ps1 -ParseOnly -LogFile qortal.log
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('bootstrap', 'genesis')]
+    [string] $Mode = 'bootstrap',
+
+    [int] $MaxMinutes = 60,
+    [int] $BlockInterval = 100,
+    [int] $ApiPort = 12391,
+    [string] $OutFile,
+    [string] $LogFile,
+
+    # Re-parse an existing log instead of running a sync
+    [switch] $ParseOnly,
+
+    # Skip the confirmation prompt before wiping the database
+    [switch] $Force
+)
+
+$ErrorActionPreference = 'Stop'
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $repoRoot
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if (-not $LogFile) { $LogFile = Join-Path $repoRoot 'qortal.log' }
+if (-not $OutFile) {
+    $OutFile = Join-Path $repoRoot "bench\at-bench-$Mode-$stamp.md"
+}
+
+function Write-Step { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+function Write-Warn { param([string] $Message) Write-Host "  ! $Message" -ForegroundColor Yellow }
+
+# Report metadata; populated by the run phase, left as placeholders in -ParseOnly mode.
+$useBootstrap = ($Mode -eq 'bootstrap')
+$jar          = $null
+$elapsed      = $null
+$reachedSync  = $false
+$startHeight  = $null
+$lastHeight   = $null
+
+function Invoke-BenchRun {
+# --------------------------------------------------------------------------------------
+# 1. Preconditions
+# --------------------------------------------------------------------------------------
+
+Write-Step "Checking preconditions"
+
+$script:jar = Get-ChildItem -Path (Join-Path $repoRoot 'target') -Filter 'qortal-*.jar' -ErrorAction SilentlyContinue |
+       Where-Object { $_.Name -notlike 'original-*' } |
+       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $script:jar) {
+    throw "No target/qortal-*.jar found. Build first (mvn -DskipTests package)."
+}
+
+# Warn if the jar predates the instrumented sources - it would silently produce no metrics
+$newestSource = Get-ChildItem -Path (Join-Path $repoRoot 'src\main\java') -Filter '*.java' -Recurse |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newestSource.LastWriteTime -gt $script:jar.LastWriteTime) {
+    Write-Warn "$($script:jar.Name) is older than $($newestSource.Name) - rebuild or metrics may be stale/missing."
+}
+
+# Refuse to trash the database out from under a live node
+$running = Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
+           Where-Object { $_.CommandLine -like '*qortal.jar*' -or $_.CommandLine -like '*qortal-*.jar*' }
+if ($running) {
+    throw "A Qortal node appears to be running (PID $($running.ProcessId -join ', ')). Stop it first (.\stop.sh)."
+}
+
+# --------------------------------------------------------------------------------------
+# 2. Wipe the database
+# --------------------------------------------------------------------------------------
+
+$dbDirs = Get-ChildItem -Path $repoRoot -Directory -Filter 'db*' -ErrorAction SilentlyContinue
+if ($dbDirs) {
+    $totalMb = [math]::Round((($dbDirs | ForEach-Object {
+        (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
+         Measure-Object -Property Length -Sum).Sum
+    } | Measure-Object -Sum).Sum / 1MB), 1)
+
+    Write-Step "About to delete the blockchain database"
+    $dbDirs | ForEach-Object { Write-Host "      $($_.FullName)" }
+    Write-Host "      total: $totalMb MB"
+
+    if (-not $Force) {
+        $reply = Read-Host "Delete these and force a full re-sync? (y/N)"
+        if ($reply -ne 'y') { throw "Aborted by user - nothing deleted." }
+    }
+
+    foreach ($d in $dbDirs) { Remove-Item -Recurse -Force -Path $d.FullName }
+    Write-Host "  deleted $($dbDirs.Count) database director$(if ($dbDirs.Count -eq 1) { 'y' } else { 'ies' })"
+} else {
+    Write-Step "No existing db* directory - already clean"
+}
+
+# Archive any previous log so the parse only sees this run
+if (Test-Path $LogFile) {
+    $archived = Join-Path $repoRoot "qortal.log.$stamp.bak"
+    Move-Item -Path $LogFile -Destination $archived -Force
+    Write-Host "  archived previous log -> $(Split-Path -Leaf $archived)"
+}
+
+# --------------------------------------------------------------------------------------
+# 3. Settings for the chosen mode
+# --------------------------------------------------------------------------------------
+
+Write-Step "Configuring settings.json for mode '$Mode'"
+
+$settingsPath = Join-Path $repoRoot 'settings.json'
+if (Test-Path $settingsPath) {
+    $backup = Join-Path $repoRoot "settings.json.$stamp.bak"
+    Copy-Item -Path $settingsPath -Destination $backup -Force
+    Write-Host "  backed up existing settings.json -> $(Split-Path -Leaf $backup)"
+}
+
+$settings = [ordered]@{
+    bootstrap = $script:useBootstrap
+    apiPort   = $ApiPort
+}
+($settings | ConvertTo-Json -Depth 4) | Set-Content -Path $settingsPath -Encoding utf8
+Write-Host "  bootstrap = $($script:useBootstrap)"
+
+# --------------------------------------------------------------------------------------
+# 4. Start the node
+# --------------------------------------------------------------------------------------
+
+Write-Step "Starting node (metrics window = $BlockInterval blocks)"
+
+# start.sh convention: the runtime jar lives at the repo root as qortal.jar.
+# The manifest's "Class-Path: . .." is what lets log4j2.properties in cwd be picked up.
+Copy-Item -Path $script:jar.FullName -Destination (Join-Path $repoRoot 'qortal.jar') -Force
+
+$javaArgs = @(
+    '-Djava.net.preferIPv4Stack=false',
+    '-XX:MaxRAMPercentage=50', '-XX:+UseG1GC', '-Xss1024k',
+    "-Dqortal.atMetrics.blockInterval=$BlockInterval",
+    '-jar', 'qortal.jar'
+)
+
+$proc = Start-Process -FilePath 'java' -ArgumentList $javaArgs -WorkingDirectory $repoRoot `
+                      -RedirectStandardOutput (Join-Path $repoRoot 'run.log') `
+                      -RedirectStandardError  (Join-Path $repoRoot 'run.err.log') `
+                      -PassThru -NoNewWindow
+Set-Content -Path (Join-Path $repoRoot 'run.pid') -Value $proc.Id
+Write-Host "  java pid $($proc.Id), jar $($script:jar.Name)"
+
+$runStart = Get-Date
+
+# --------------------------------------------------------------------------------------
+# 5. Poll until synced or out of time
+# --------------------------------------------------------------------------------------
+
+function Get-SyncState {
+    param([int] $Port)
+    try {
+        $status = Invoke-RestMethod -Uri "http://localhost:$Port/admin/status" -TimeoutSec 10
+        $last   = Invoke-RestMethod -Uri "http://localhost:$Port/blocks/last"  -TimeoutSec 10
+        $nowMs  = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        return [pscustomobject]@{
+            Ok            = $true
+            Height        = [int] $status.height
+            Synchronizing = [bool] $status.isSynchronizing
+            SyncPercent   = $status.syncPercent
+            Connections   = [int] $status.numberOfConnections
+            TipAgeSec     = [int] [math]::Round(($nowMs - [double] $last.timestamp) / 1000)
+        }
+    } catch {
+        return [pscustomobject]@{ Ok = $false }
+    }
+}
+
+Write-Step "Waiting for sync (budget: $MaxMinutes min). Ctrl-C aborts; node keeps running."
+
+$deadline       = $runStart.AddMinutes($MaxMinutes)
+$syncedStreak   = 0
+$requiredStreak = 3           # consecutive good polls before declaring synced
+$script:lastHeight = 0
+
+while ((Get-Date) -lt $deadline) {
+    if ($proc.HasExited) {
+        Write-Warn "Node exited early (code $($proc.ExitCode)) - see run.log / run.err.log"
+        break
+    }
+
+    Start-Sleep -Seconds 15
+    $s = Get-SyncState -Port $ApiPort
+    if (-not $s.Ok) { Write-Host "  api not ready yet..."; continue }
+
+    if ($null -eq $script:startHeight -and $s.Height -gt 0) { $script:startHeight = $s.Height }
+    $script:lastHeight = $s.Height
+
+    $pct = if ($null -ne $s.SyncPercent) { "$($s.SyncPercent)%" } else { 'n/a' }
+    $elapsedMin = [int] ((Get-Date) - $runStart).TotalMinutes
+    Write-Host ("  [{0,3}m] height={1} sync={2} pct={3} peers={4} tipAge={5}s" -f `
+                $elapsedMin, $s.Height, $s.Synchronizing, $pct, $s.Connections, $s.TipAgeSec)
+
+    # Approximates Controller.isUpToDate(): recent chain tip plus enough peers.
+    # isUpToDate() itself is not exposed over the API.
+    $looksSynced = (-not $s.Synchronizing) -and ($s.Connections -ge 3) -and
+                   ($s.TipAgeSec -ge 0) -and ($s.TipAgeSec -lt 600)
+
+    if ($looksSynced) {
+        $syncedStreak++
+        if ($syncedStreak -ge $requiredStreak) { $script:reachedSync = $true; break }
+    } else {
+        $syncedStreak = 0
+    }
+}
+
+$script:elapsed = (Get-Date) - $runStart
+
+if ($script:reachedSync) {
+    Write-Step ("Synced at height {0} after {1:n1} min" -f $script:lastHeight, $script:elapsed.TotalMinutes)
+} else {
+    Write-Step ("Stopped at height {0} after {1:n1} min (time budget reached)" -f $script:lastHeight, $script:elapsed.TotalMinutes)
+}
+
+# --------------------------------------------------------------------------------------
+# 6. Stop the node cleanly (lets the shutdown hook flush the final partial window)
+# --------------------------------------------------------------------------------------
+
+Write-Step "Stopping node"
+
+if (-not $proc.HasExited) {
+    $apiKey = $null
+    $apiKeyPath = Join-Path $repoRoot 'apikey.txt'
+    if (Test-Path $apiKeyPath) { $apiKey = (Get-Content $apiKeyPath -Raw).Trim() }
+
+    if ($apiKey) {
+        try {
+            Invoke-RestMethod -Uri "http://localhost:$ApiPort/admin/stop?apiKey=$apiKey" -TimeoutSec 20 | Out-Null
+            Write-Host "  requested shutdown via /admin/stop"
+        } catch {
+            Write-Warn "/admin/stop failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Warn "no apikey.txt - cannot use /admin/stop"
+    }
+
+    # Give it time to close HSQLDB and run the metrics shutdown hook
+    $waited = 0
+    while (-not $proc.HasExited -and $waited -lt 180) { Start-Sleep -Seconds 2; $waited += 2 }
+
+    if (-not $proc.HasExited) {
+        Write-Warn "still running after ${waited}s - killing (final metrics window may be lost)"
+        Stop-Process -Id $proc.Id -Force
+    } else {
+        Write-Host "  exited cleanly after ${waited}s"
+    }
+}
+Remove-Item -Path (Join-Path $repoRoot 'run.pid') -Force -ErrorAction SilentlyContinue
+} # end Invoke-BenchRun
+
+# --------------------------------------------------------------------------------------
+# 7. Run (unless we are only re-parsing an existing log)
+# --------------------------------------------------------------------------------------
+
+if ($ParseOnly) {
+    Write-Step "Parse-only: skipping wipe/start/wait"
+} else {
+    Invoke-BenchRun
+}
+
+# --------------------------------------------------------------------------------------
+# 8. Parse AT-METRICS lines
+# --------------------------------------------------------------------------------------
+
+Write-Step "Parsing $((Split-Path -Leaf $LogFile))"
+
+if (-not (Test-Path $LogFile)) { throw "Log not found: $LogFile - did the node start? See run.log." }
+
+$windows = @()
+foreach ($line in (Select-String -Path $LogFile -Pattern 'AT-METRICS' | ForEach-Object { $_.Line })) {
+    $kv = @{}
+    foreach ($m in [regex]::Matches($line, '(\w+)=([-\d.]+)')) {
+        $kv[$m.Groups[1].Value] = [double] $m.Groups[2].Value
+    }
+    if ($kv.ContainsKey('ats') -and $kv['ats'] -gt 0) { $windows += [pscustomobject] $kv }
+}
+
+Write-Host "  found $($windows.Count) metrics window(s)"
+
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutFile) | Out-Null
+
+$md = New-Object System.Text.StringBuilder
+function Add-Line { param([string] $Text = '') [void] $md.AppendLine($Text) }
+
+Add-Line "# AT persistence benchmark - $Mode"
+Add-Line
+Add-Line "Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Add-Line
+Add-Line '## Run'
+Add-Line
+Add-Line '| | |'
+Add-Line '|---|---|'
+Add-Line "| Source log | ``$(Split-Path -Leaf $LogFile)`` |"
+if ($ParseOnly) {
+    Add-Line '| Mode | parse-only (re-parsed an existing log; run metadata unknown) |'
+} else {
+    Add-Line "| Mode | ``$Mode`` (bootstrap=$useBootstrap) |"
+    Add-Line ("| Duration | {0:n1} min |" -f $elapsed.TotalMinutes)
+    Add-Line "| Outcome | $(if ($reachedSync) { 'reached sync' } else { 'time budget reached' }) |"
+    Add-Line "| Height | $startHeight -> $lastHeight |"
+    Add-Line "| Jar | ``$($jar.Name)`` ($(Get-Date $jar.LastWriteTime -Format 'yyyy-MM-dd HH:mm')) |"
+    Add-Line "| Metrics window | $BlockInterval blocks |"
+}
+Add-Line
+
+if ($windows.Count -eq 0) {
+    Add-Line '## No data'
+    Add-Line
+    Add-Line 'No `AT-METRICS` lines were logged. Likely causes:'
+    Add-Line
+    Add-Line '- The jar was built from un-instrumented source (rebuild: `mvn -DskipTests package`).'
+    Add-Line '- No blocks containing ATs were processed (common early in a genesis sync, or if a'
+    Add-Line '  bootstrap left almost no gap to gap-sync).'
+    Add-Line '- The node was killed rather than shut down cleanly, losing the final partial window.'
+    ($md.ToString()) | Set-Content -Path $OutFile -Encoding utf8
+    Write-Warn "No AT-METRICS lines found - see $OutFile"
+    return
+}
+
+# Reconstruct per-window totals so windows can be weighted by their AT count
+$totBlocks = ($windows | Measure-Object -Property blocks -Sum).Sum
+$totAts    = ($windows | Measure-Object -Property ats    -Sum).Sum
+
+$sum = @{ fromAt = 0.0; modBal = 0.0; update = 0.0; saveStates = 0.0; saveStatesData = 0.0 }
+foreach ($w in $windows) {
+    $sum.fromAt         += $w.fromATAddressMs
+    $sum.modBal         += $w.modifyBalanceMs
+    $sum.update         += $w.atUpdateMs
+    $sum.saveStates     += ($w.saveATStatesUs     * $w.ats / 1000.0)
+    $sum.saveStatesData += ($w.saveATStatesDataUs * $w.ats / 1000.0)
+}
+
+# modifyBalance + fromATAddress + at.update are disjoint and together make up the loop body.
+$totalMs     = $sum.fromAt + $sum.modBal + $sum.update
+# at.update minus its two timed upserts leaves save(ATData) + flags-only state parsing.
+$remainderMs = $sum.update - $sum.saveStates - $sum.saveStatesData
+
+# $StepMs, not $TotalMs: PowerShell identifiers are case-insensitive, so a $TotalMs
+# parameter would shadow the script-level $totalMs and make every share read 100%.
+function Row {
+    param([string] $Name, [double] $StepMs, [string] $Note = '')
+    $perAt = if ($totAts -gt 0)  { $StepMs * 1000.0 / $totAts } else { 0 }
+    $pct   = if ($totalMs -gt 0) { $StepMs / $totalMs * 100.0 } else { 0 }
+    Add-Line ("| {0} | {1:n1} | {2:n1} | {3:n1}% | {4} |" -f $Name, $perAt, $StepMs, $pct, $Note)
+}
+
+Add-Line '## Where the time goes'
+Add-Line
+Add-Line "Across **$totBlocks blocks** / **$totAts AT states** ($([math]::Round($totAts / [double]$totBlocks, 1)) ATs per block)."
+Add-Line
+Add-Line '| Step | µs/AT | total ms | share | notes |'
+Add-Line '|---|---:|---:|---:|---|'
+Row 'modifyAssetBalance' $sum.modBal 'single UPDATE on AccountBalances'
+Row 'fromATAddress'      $sum.fromAt 'SELECT incl. immutable code_bytes BLOB'
+Row 'at.update **(total)**' $sum.update 'sum of the three rows below'
+Add-Line ("| &nbsp;&nbsp;- save ATStates | {0:n1} | {1:n1} | {2:n1}% | metadata upsert |" -f `
+    ($sum.saveStates * 1000.0 / $totAts), $sum.saveStates, ($sum.saveStates / $totalMs * 100.0))
+Add-Line ("| &nbsp;&nbsp;- save ATStatesData | {0:n1} | {1:n1} | {2:n1}% | state_data BLOB upsert |" -f `
+    ($sum.saveStatesData * 1000.0 / $totAts), $sum.saveStatesData, ($sum.saveStatesData / $totalMs * 100.0))
+Add-Line ("| &nbsp;&nbsp;- save(ATData) + parse | {0:n1} | {1:n1} | {2:n1}% | rewrites code_bytes BLOB |" -f `
+    ($remainderMs * 1000.0 / $totAts), $remainderMs, ($remainderMs / $totalMs * 100.0))
+Add-Line ("| **Total** | **{0:n1}** | **{1:n1}** | **100%** | per AT, per block |" -f `
+    ($totalMs * 1000.0 / $totAts), $totalMs)
+Add-Line
+Add-Line ("Estimated AT-persistence cost per block: **{0:n1} ms**." -f ($totalMs / $totBlocks))
+Add-Line
+
+Add-Line '## Reading this'
+Add-Line
+Add-Line '- `fromATAddress` + `save(ATData)` are the two steps that touch the **immutable** AT'
+Add-Line '  bytecode (`code_bytes`). Any share they hold is avoidable: the read only needs the'
+Add-Line '  mutable flag columns, and the write rewrites bytecode that never changes after creation.'
+Add-Line '- `save ATStatesData` is the real state BLOB. This cost is inherent, though the'
+Add-Line '  `ON DUPLICATE KEY UPDATE` form forces an index probe even during a fresh sync where'
+Add-Line '  every write is an insert.'
+Add-Line '- Every step above is un-batched: one statement per AT per block. Sibling paths in'
+Add-Line '  `Block.processBlock()` already batch (`modifyMintedBlockCounts`, `modifyAssetBalances`).'
+Add-Line '- Caveat: `save(ATStateData)` is timed at every caller, not just the block loop, so the'
+Add-Line '  two `save AT*` rows can be slightly inflated by non-sync callers.'
+Add-Line '- Caveat: this measures **persistence only**. AT bytecode execution happens earlier in'
+Add-Line '  `Block.executeATs()` and is not counted here.'
+Add-Line '- Caveat: shipped `log4j2.properties` sets `org.qortal.repository.hsqldb` to `debug`,'
+Add-Line '  which adds logging overhead inside these timed DB calls.'
+Add-Line
+
+Add-Line '## Windows'
+Add-Line
+Add-Line '| heights | blocks | ATs | ATs/blk | fromATAddress µs | modifyBalance µs | at.update µs | saveATStates µs | saveATStatesData µs |'
+Add-Line '|---|---:|---:|---:|---:|---:|---:|---:|---:|'
+foreach ($w in $windows) {
+    Add-Line ("| {0}-{1} | {2} | {3} | {4:n1} | {5:n1} | {6:n1} | {7:n1} | {8:n1} | {9:n1} |" -f `
+        [int] $w.heightFrom, [int] $w.heightTo, [int] $w.blocks, [int] $w.ats, $w.atsPerBlock,
+        $w.fromATAddressUs, $w.modifyBalanceUs, $w.atUpdateUs, $w.saveATStatesUs, $w.saveATStatesDataUs)
+}
+Add-Line
+
+($md.ToString()) | Set-Content -Path $OutFile -Encoding utf8
+
+Write-Step "Report written"
+Write-Host "  $OutFile"
