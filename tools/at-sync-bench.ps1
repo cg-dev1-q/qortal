@@ -503,8 +503,12 @@ Add-Line '- Caveat: `save(ATStateData)` is timed at every caller, not just the b
 Add-Line '  two `save AT*` rows can be slightly inflated by non-sync callers.'
 Add-Line '- Caveat: this measures **persistence only**. AT bytecode execution happens earlier in'
 Add-Line '  `Block.executeATs()` and is not counted here.'
-Add-Line '- Caveat: shipped `log4j2.properties` sets `org.qortal.repository.hsqldb` to `debug`,'
-Add-Line '  which adds logging overhead inside these timed DB calls.'
+Add-Line '- Logging is *not* inflating these timings, despite `log4j2.properties` setting'
+Add-Line '  `org.qortal.repository.hsqldb` to `debug`. The per-SQL logging in'
+Add-Line '  `HSQLDBRepository.prepareStatement()` is gated by a `debugState` flag that defaults'
+Add-Line '  to false and has no callers, so it never fires; a 79-block sync logged 1 DEBUG line'
+Add-Line '  and no SQL. Timings would only be skewed if repository debug were enabled at runtime,'
+Add-Line '  or if `slowQueryThreshold` were set in settings.json.'
 Add-Line
 
 Add-Line '## Windows'
