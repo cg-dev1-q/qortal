@@ -35,8 +35,11 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('bootstrap', 'genesis')]
+    [ValidateSet('bootstrap', 'genesis', 'orphan')]
     [string] $Mode = 'bootstrap',
+
+    # orphan mode only: how many blocks to rewind before re-syncing them.
+    [int] $OrphanBlocks = 2000,
 
     [int] $MaxMinutes = 60,
 
@@ -136,6 +139,7 @@ $elapsed      = $null
 $reachedSync  = $false
 $startHeight  = $null
 $lastHeight   = $null
+$orphanedTo   = $null
 
 function Invoke-BenchRun {
 # --------------------------------------------------------------------------------------
@@ -175,7 +179,15 @@ if ($running) {
 # --------------------------------------------------------------------------------------
 
 $dbDirs = Get-ChildItem -Path $repoRoot -Directory -Filter 'db*' -ErrorAction SilentlyContinue
-if ($dbDirs) {
+
+if ($Mode -eq 'orphan') {
+    # Orphan mode measures re-processing of AT-heavy blocks against a full-size database,
+    # which is the whole point - so the database must be kept, not wiped.
+    if (-not $dbDirs) {
+        throw "Mode 'orphan' needs an existing synced database, but no db* directory exists. Run -Mode bootstrap first."
+    }
+    Write-Step "Keeping existing database (orphan mode re-processes blocks against it)"
+} elseif ($dbDirs) {
     $totalMb = [math]::Round((($dbDirs | ForEach-Object {
         (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
          Measure-Object -Property Length -Sum).Sum
@@ -279,13 +291,6 @@ function Get-SyncState {
     }
 }
 
-Write-Step "Waiting for sync (budget: $MaxMinutes min). Ctrl-C aborts; node keeps running."
-
-$deadline       = $runStart.AddMinutes($MaxMinutes)
-$syncedStreak   = 0
-$requiredStreak = 3           # consecutive good polls before declaring synced
-$script:lastHeight = 0
-
 # A node that dies during startup (bad settings, port clash) can leave a non-daemon thread
 # alive, so the process never exits and HasExited never fires. Without a guard the poll loop
 # would spin "api not ready" for the whole budget.
@@ -295,62 +300,145 @@ $script:lastHeight = 0
 # ~5 of them - so neither a 5 min deadline nor a log-liveness check can tell "still working"
 # from "hung". Key off a fatal startup error instead, and keep the deadline generous.
 $fatalStartupPattern = 'ERROR\s+Settings:|Exception in thread "main"'
+$script:apiEverUp = $false
+$script:lastHeight = 0
+
+# Poll until the node looks synced, or $Deadline passes. Returns $true if sync was reached.
+# Called twice in orphan mode: once for the initial catch-up, once for the re-sync that is
+# actually being measured.
+function Wait-ForSync {
+    param([datetime] $Deadline, [datetime] $ApiDeadline, [string] $Phase)
+
+    $syncedStreak   = 0
+    $requiredStreak = 3           # consecutive good polls before declaring synced
+
+    while ((Get-Date) -lt $Deadline) {
+        if ($proc.HasExited) {
+            Write-Warn "Node exited early (code $($proc.ExitCode)) - see run.log / run.err.log"
+            return $false
+        }
+
+        Start-Sleep -Seconds 15
+        $s = Get-SyncState -Port $ApiPort
+        if (-not $s.Ok) {
+            if ($script:apiEverUp) {
+                Write-Warn "API stopped responding - node may have died. See qortal.log."
+                return $false
+            }
+
+            Write-Host "  api not ready yet (bootstrap download/extract can take ~10 min)..."
+
+            $fatal = $null
+            if (Test-Path $LogFile) {
+                $fatal = Select-String -Path $LogFile -Pattern $fatalStartupPattern | Select-Object -Last 3
+            }
+            if ($fatal) {
+                Write-Warn "Fatal startup error - aborting:"
+                $fatal | ForEach-Object { Write-Host "      $($_.Line)" }
+                return $false
+            }
+
+            if ((Get-Date) -gt $ApiDeadline) {
+                Write-Warn "API did not come up within $ApiTimeoutMinutes min - giving up."
+                return $false
+            }
+            continue
+        }
+        $script:apiEverUp = $true
+
+        if ($null -eq $script:startHeight -and $s.Height -gt 0) { $script:startHeight = $s.Height }
+        $script:lastHeight = $s.Height
+
+        $pct = if ($null -ne $s.SyncPercent) { "$($s.SyncPercent)%" } else { 'n/a' }
+        $elapsedMin = [int] ((Get-Date) - $runStart).TotalMinutes
+        Write-Host ("  [{0,3}m] {1} height={2} sync={3} pct={4} peers={5} tipAge={6}s" -f `
+                    $elapsedMin, $Phase, $s.Height, $s.Synchronizing, $pct, $s.Connections, $s.TipAgeSec)
+
+        # Approximates Controller.isUpToDate(): recent chain tip plus enough peers.
+        # isUpToDate() itself is not exposed over the API.
+        $looksSynced = (-not $s.Synchronizing) -and ($s.Connections -ge 3) -and
+                       ($s.TipAgeSec -ge 0) -and ($s.TipAgeSec -lt 600)
+
+        if ($looksSynced) {
+            $syncedStreak++
+            if ($syncedStreak -ge $requiredStreak) { return $true }
+        } else {
+            $syncedStreak = 0
+        }
+    }
+    return $false
+}
+
+# Rewind the chain so the node re-downloads and re-processes those blocks. BlockChain.orphan()
+# uses tryLock on the blockchain lock, so this only works while not actively syncing - hence
+# it is called after the initial sync settles.
+#
+# /admin/orphan does not return until every block is orphaned, and that is slow - measured at
+# ~5.4 blocks/sec, so 2000 blocks needs ~6 min. The timeout must be generous: a client-side
+# timeout does NOT stop the server, it just blinds us while it keeps working. Never retry at
+# a shallower depth after a timeout either - by then the chain height has already dropped
+# below the retry target, so the node answers 400 INVALID_HEIGHT and the failure looks real
+# when the original orphan was in fact succeeding.
+function Invoke-Orphan {
+    param([int] $Port, [int] $FromHeight, [int] $Blocks)
+
+    $target = $FromHeight - $Blocks
+    if ($target -lt 1) {
+        Write-Warn "orphan target height $target is invalid - skipping"
+        return $null
+    }
+
+    # ~5.4 blocks/sec observed; allow roughly 3x headroom plus a floor.
+    $timeoutSec = [int]($Blocks / 2) + 300
+    Write-Host "  orphaning to $target (timeout ${timeoutSec}s; expect ~$([int]($Blocks / 5))s)"
+
+    $apiKey = Get-QortalApiKey
+    try {
+        $r = Invoke-RestMethod -Uri "http://localhost:$Port/admin/orphan" -Method Post `
+                               -Headers @{ 'X-API-KEY' = $apiKey } `
+                               -ContentType 'text/plain' -Body "$target" -TimeoutSec $timeoutSec
+        if ("$r".Trim() -eq 'true') {
+            Write-Host "  orphaned $Blocks blocks: $FromHeight -> $target"
+            return $target
+        }
+        # "false" means BlockChain.orphan() could not take the blockchain lock
+        Write-Warn "orphan returned '$r' - blockchain lock busy, node was probably still syncing"
+        return $null
+    } catch {
+        # The server keeps orphaning regardless. Check where the chain actually landed rather
+        # than assuming failure.
+        Write-Warn "orphan request failed client-side: $($_.Exception.Message)"
+        $s = Get-SyncState -Port $Port
+        if ($s.Ok -and $s.Height -lt $FromHeight) {
+            Write-Warn "but the chain did rewind to $($s.Height) - measuring from there"
+            return [int] $s.Height
+        }
+        return $null
+    }
+}
+
+$deadline    = $runStart.AddMinutes($MaxMinutes)
 $apiDeadline = $runStart.AddMinutes($ApiTimeoutMinutes)
-$apiEverUp   = $false
 
-while ((Get-Date) -lt $deadline) {
-    if ($proc.HasExited) {
-        Write-Warn "Node exited early (code $($proc.ExitCode)) - see run.log / run.err.log"
-        break
-    }
+Write-Step "Waiting for sync (budget: $MaxMinutes min). Ctrl-C aborts; node keeps running."
+$script:reachedSync = Wait-ForSync -Deadline $deadline -ApiDeadline $apiDeadline -Phase 'sync'
 
-    Start-Sleep -Seconds 15
-    $s = Get-SyncState -Port $ApiPort
-    if (-not $s.Ok) {
-        if ($apiEverUp) {
-            # API went away after being up - node died mid-run
-            Write-Warn "API stopped responding - node may have died. See qortal.log."
-            break
-        }
-
-        Write-Host "  api not ready yet (bootstrap download/extract can take ~10 min)..."
-
-        $fatal = $null
-        if (Test-Path $LogFile) {
-            $fatal = Select-String -Path $LogFile -Pattern $fatalStartupPattern | Select-Object -Last 3
-        }
-        if ($fatal) {
-            Write-Warn "Fatal startup error - aborting:"
-            $fatal | ForEach-Object { Write-Host "      $($_.Line)" }
-            break
-        }
-
-        if ((Get-Date) -gt $apiDeadline) {
-            Write-Warn "API did not come up within $ApiTimeoutMinutes min - giving up."
-            break
-        }
-        continue
-    }
-    $apiEverUp = $true
-
-    if ($null -eq $script:startHeight -and $s.Height -gt 0) { $script:startHeight = $s.Height }
-    $script:lastHeight = $s.Height
-
-    $pct = if ($null -ne $s.SyncPercent) { "$($s.SyncPercent)%" } else { 'n/a' }
-    $elapsedMin = [int] ((Get-Date) - $runStart).TotalMinutes
-    Write-Host ("  [{0,3}m] height={1} sync={2} pct={3} peers={4} tipAge={5}s" -f `
-                $elapsedMin, $s.Height, $s.Synchronizing, $pct, $s.Connections, $s.TipAgeSec)
-
-    # Approximates Controller.isUpToDate(): recent chain tip plus enough peers.
-    # isUpToDate() itself is not exposed over the API.
-    $looksSynced = (-not $s.Synchronizing) -and ($s.Connections -ge 3) -and
-                   ($s.TipAgeSec -ge 0) -and ($s.TipAgeSec -lt 600)
-
-    if ($looksSynced) {
-        $syncedStreak++
-        if ($syncedStreak -ge $requiredStreak) { $script:reachedSync = $true; break }
+if ($Mode -eq 'orphan' -and $OrphanBlocks -eq 0) {
+    # -OrphanBlocks 0 means the database is already behind the tip (e.g. left rewound by a
+    # previous run), so just measure it catching back up.
+    Write-Step "OrphanBlocks=0 - skipping rewind, measuring the sync from the current height"
+} elseif ($Mode -eq 'orphan') {
+    if (-not $script:reachedSync) {
+        Write-Warn "Never reached sync - skipping orphan step."
     } else {
-        $syncedStreak = 0
+        Write-Step "Orphaning $OrphanBlocks blocks from height $($script:lastHeight) to force re-processing"
+        $script:orphanedTo = Invoke-Orphan -Port $ApiPort -FromHeight $script:lastHeight -Blocks $OrphanBlocks
+
+        if ($null -ne $script:orphanedTo) {
+            $script:startHeight = $script:orphanedTo
+            Write-Step "Waiting for re-sync of the orphaned blocks (this is the measured phase)"
+            $script:reachedSync = Wait-ForSync -Deadline $deadline -ApiDeadline $apiDeadline -Phase 're-sync'
+        }
     }
 }
 
@@ -422,6 +510,15 @@ if ($ParseOnly) {
     Add-Line ("| Duration | {0:n1} min |" -f $elapsed.TotalMinutes)
     Add-Line "| Outcome | $(if ($reachedSync) { 'reached sync' } else { 'time budget reached' }) |"
     Add-Line "| Height | $startHeight -> $lastHeight |"
+    if ($Mode -eq 'orphan') {
+        if ($OrphanBlocks -eq 0) {
+            Add-Line '| Orphaned to | not requested (`-OrphanBlocks 0`); measured the database catching up from where it already stood |'
+        } elseif ($null -ne $orphanedTo) {
+            Add-Line "| Orphaned to | $orphanedTo (re-processed against a full-size database) |"
+        } else {
+            Add-Line '| Orphaned to | **failed** - numbers below are a plain sync, not a re-sync |'
+        }
+    }
     Add-Line "| Jar | ``$($jar.Name)`` ($(Get-Date $jar.LastWriteTime -Format 'yyyy-MM-dd HH:mm')) |"
     Add-Line "| Metrics window | $BlockInterval blocks |"
 }
