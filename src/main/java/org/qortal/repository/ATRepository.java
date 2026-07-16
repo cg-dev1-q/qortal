@@ -37,6 +37,20 @@ public interface ATRepository {
 	/** Saves ATData into repository */
 	public void save(ATData atData) throws DataException;
 
+	/**
+	 * Updates only an AT's mutable execution flags, leaving its immutable fields untouched.
+	 * <p>
+	 * {@link #save(ATData)} rewrites every column, including the <tt>code_bytes</tt> BLOB that
+	 * never changes after the AT is deployed. Block processing updates these flags for every
+	 * executable AT of every block, so it uses this instead to avoid that write - and, since
+	 * the immutable fields are not needed, to avoid reading the AT back first.
+	 *
+	 * @throws DataException if no such AT exists
+	 */
+	public void updateFlags(String atAddress, boolean isSleeping, Integer sleepUntilHeight,
+			boolean isFinished, boolean hadFatalError, boolean isFrozen, Long frozenBalance,
+			Long sleepUntilMessageTimestamp) throws DataException;
+
 	/** Removes an AT from repository, including associated ATStateData */
 	public void delete(String atAddress) throws DataException;
 

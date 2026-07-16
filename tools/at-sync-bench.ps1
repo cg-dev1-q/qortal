@@ -572,13 +572,13 @@ Add-Line
 Add-Line '| Step | µs/AT | total ms | share | notes |'
 Add-Line '|---|---:|---:|---:|---|'
 Row 'modifyAssetBalance' $sum.modBal 'single UPDATE on AccountBalances'
-Row 'fromATAddress'      $sum.fromAt 'SELECT incl. immutable code_bytes BLOB'
+Row 'fromATAddress'      $sum.fromAt 'AT row fetch; 0 once the code_bytes read is removed'
 Row 'at.update **(total)**' $sum.update 'sum of the three rows below'
 Add-Line ("| &nbsp;&nbsp;- save ATStates | {0:n1} | {1:n1} | {2:n1}% | metadata upsert |" -f `
     ($sum.saveStates * 1000.0 / $totAts), $sum.saveStates, ($sum.saveStates / $totalMs * 100.0))
 Add-Line ("| &nbsp;&nbsp;- save ATStatesData | {0:n1} | {1:n1} | {2:n1}% | state_data BLOB upsert |" -f `
     ($sum.saveStatesData * 1000.0 / $totAts), $sum.saveStatesData, ($sum.saveStatesData / $totalMs * 100.0))
-Add-Line ("| &nbsp;&nbsp;- save(ATData) + parse | {0:n1} | {1:n1} | {2:n1}% | rewrites code_bytes BLOB |" -f `
+Add-Line ("| &nbsp;&nbsp;- AT row write + parse | {0:n1} | {1:n1} | {2:n1}% | save(ATData) upsert, or updateFlags once optimised |" -f `
     ($remainderMs * 1000.0 / $totAts), $remainderMs, ($remainderMs / $totalMs * 100.0))
 Add-Line ("| **Total** | **{0:n1}** | **{1:n1}** | **100%** | per AT, per block |" -f `
     ($totalMs * 1000.0 / $totAts), $totalMs)

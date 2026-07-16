@@ -396,6 +396,27 @@ public class HSQLDBATRepository implements ATRepository {
 	}
 
 	@Override
+	public void updateFlags(String atAddress, boolean isSleeping, Integer sleepUntilHeight,
+			boolean isFinished, boolean hadFatalError, boolean isFrozen, Long frozenBalance,
+			Long sleepUntilMessageTimestamp) throws DataException {
+		String sql = "UPDATE ATs SET is_sleeping = ?, sleep_until_height = ?, is_finished = ?, "
+				+ "had_fatal_error = ?, is_frozen = ?, frozen_balance = ?, sleep_until_message_timestamp = ? "
+				+ "WHERE AT_address = ?";
+
+		try {
+			int rowCount = this.repository.executeCheckedUpdate(sql, isSleeping, sleepUntilHeight, isFinished,
+					hadFatalError, isFrozen, frozenBalance, sleepUntilMessageTimestamp, atAddress);
+
+			// save(ATData) would have inserted a row here. Updating nothing means the AT is
+			// missing, which callers rely on being an error rather than a silent no-op.
+			if (rowCount != 1)
+				throw new DataException("Unable to update flags for unknown AT " + atAddress);
+		} catch (SQLException e) {
+			throw new DataException("Unable to update AT flags in repository", e);
+		}
+	}
+
+	@Override
 	public void delete(String atAddress) throws DataException {
 		try {
 			this.repository.delete("ATs", "AT_address = ?", atAddress);

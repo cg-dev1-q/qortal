@@ -1930,8 +1930,6 @@ public class Block {
 	}
 
 	protected void processAtFeesAndStates() throws DataException {
-		ATRepository atRepository = this.repository.getATRepository();
-
 		// Safety check: ourAtStates should have been populated during validation
 		if (this.ourAtStates == null) {
 			throw new IllegalStateException("Cannot process AT fees and states: ourAtStates is null. Block validation may have failed.");
@@ -1947,14 +1945,11 @@ public class Block {
 			atAccount.modifyAssetBalance(Asset.QORT, - atStateData.getFees());
 			metrics.addModifyBalance(System.nanoTime() - start);
 
-			// Update AT info with latest state
+			// Update AT info with latest state. The AT itself is deliberately not fetched:
+			// everything written derives from atStateData, so reading it back would only pull
+			// in its immutable fields - notably the code_bytes BLOB - to rewrite unchanged.
 			start = System.nanoTime();
-			ATData atData = atRepository.fromATAddress(atStateData.getATAddress());
-			metrics.addFromAtAddress(System.nanoTime() - start);
-
-			AT at = new AT(repository, atData, atStateData);
-			start = System.nanoTime();
-			at.update(this.blockData.getHeight(), this.blockData.getTimestamp());
+			AT.updateFromState(this.repository, atStateData);
 			metrics.addAtUpdate(System.nanoTime() - start);
 		}
 
